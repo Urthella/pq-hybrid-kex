@@ -1,5 +1,5 @@
 use pq_hybrid_kex::{
-    CIPHERTEXT_LEN, InvalidPublicKey, PUBLIC_KEY_LEN, decapsulate, encapsulate,
+    CIPHERTEXT_LEN, ExpandedKey, InvalidPublicKey, PUBLIC_KEY_LEN, decapsulate, encapsulate,
     encapsulate_deterministic, generate, public_key,
 };
 
@@ -54,6 +54,18 @@ fn matches_the_drafts_test_vectors() {
             v.ss,
             "vector {i}: shared secret from decapsulation"
         );
+
+        let expanded = ExpandedKey::unpack(&v.seed);
+        assert_eq!(expanded.pack(), v.seed, "vector {i}: packed key");
+        assert!(
+            expanded.public_key() == v.pk,
+            "vector {i}: expanded public key"
+        );
+        assert_eq!(
+            expanded.decapsulate(&v.ct),
+            v.ss,
+            "vector {i}: expanded decapsulation"
+        );
     }
 }
 
@@ -61,7 +73,8 @@ fn matches_the_drafts_test_vectors() {
 fn agrees_with_rustcryptos_x_wing() {
     use x_wing::kem::{Decapsulate, Decapsulator, KeyExport};
     for _ in 0..20 {
-        let (sk, pk) = generate();
+        let (expanded, pk) = generate();
+        let sk = expanded.pack();
         let theirs = x_wing::DecapsulationKey::from(sk);
         assert!(
             theirs.encapsulation_key().to_bytes().as_slice() == pk.as_slice(),
@@ -87,7 +100,7 @@ fn round_trips_with_fresh_randomness() {
     for _ in 0..50 {
         let (sk, pk) = generate();
         let (ss, ct) = encapsulate(&pk).unwrap();
-        assert_eq!(decapsulate(&ct, &sk), ss);
+        assert_eq!(sk.decapsulate(&ct), ss);
         let (ss2, ct2) = encapsulate(&pk).unwrap();
         assert!(ss2 != ss && ct2 != ct, "two encapsulations should differ");
     }
@@ -101,11 +114,11 @@ fn a_tampered_ciphertext_gives_a_different_secret_without_an_error() {
     for at in [0, 500, 1087, 1088, 1119] {
         let mut bad = ct;
         bad[at] ^= 1;
-        assert_ne!(decapsulate(&bad, &sk), ss, "flipped byte {at}");
+        assert_ne!(sk.decapsulate(&bad), ss, "flipped byte {at}");
     }
     // The wrong secret key doesn't get the secret either.
     let (other, _) = generate();
-    assert_ne!(decapsulate(&ct, &other), ss);
+    assert_ne!(other.decapsulate(&ct), ss);
 }
 
 #[test]

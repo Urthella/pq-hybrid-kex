@@ -28,7 +28,7 @@ let (secret_key, public_key) = pq_hybrid_kex::generate();
 let (shared, ciphertext) = pq_hybrid_kex::encapsulate(&public_key)?;
 
 // The receiver recovers the same secret from the ciphertext.
-assert_eq!(pq_hybrid_kex::decapsulate(&ciphertext, &secret_key), shared);
+assert_eq!(secret_key.decapsulate(&ciphertext), shared);
 ```
 
 | | Public key | Ciphertext | Secret key | Shared secret |
@@ -36,6 +36,14 @@ assert_eq!(pq_hybrid_kex::decapsulate(&ciphertext, &secret_key), shared);
 | X-Wing | 1216 B | 1120 B | 32 B | 32 B |
 
 The secret key is a 32-byte seed. SHAKE256 expands it into the ML-KEM key and the X25519 key.
+
+`generate` returns the key already expanded, as an `ExpandedKey`, following draft §5.5.1. To
+store the key, save `secret_key.pack()`, the 32-byte seed. To load it, call
+`ExpandedKey::unpack`. The expanded form has no byte encoding on purpose: the draft says it
+must not pass between implementations.
+
+`decapsulate(&ciphertext, &seed)` works straight from the seed. It is slower, because it
+expands the key on every call.
 
 ## How it's checked
 
@@ -48,13 +56,14 @@ The secret key is a 32-byte seed. SHAKE256 expands it into the ML-KEM key and th
   secret, not an error. That is ML-KEM's implicit rejection.
 - **Bad public keys.** A public key whose ML-KEM coefficients are at or above the modulus is
   refused, as FIPS 203 §7.2 requires.
-- **Mutation testing.** Twelve deliberate bugs were planted one at a time, and the tests caught
-  every one. The bugs included:
+- **Mutation testing.** Thirteen deliberate bugs were planted one at a time, and the tests
+  caught every one. The bugs included:
   - a changed label;
   - the hash inputs swapped or dropped;
   - the wrong SHAKE bytes used;
   - an X25519 input ignored;
-  - randomness turned off.
+  - randomness turned off;
+  - `pack` losing the key.
 
 ## Speed
 
@@ -63,14 +72,14 @@ rough numbers from one run on a desktop (µs per call):
 
 | | keygen | encapsulate | decapsulate |
 |---|---:|---:|---:|
-| X-Wing | 235 | 362 | 538 |
-| ML-KEM-768 alone | 142 | 158 | 219 |
-| X25519 alone | 101 | 179 | 87 |
+| X-Wing, kept `ExpandedKey` | 239 | 350 | 327 |
+| X-Wing, from the 32-byte seed | 239 | 350 | 527 |
+| ML-KEM-768 alone | 143 | 160 | 225 |
+| X25519 alone | 92 | 199 | 97 |
 
-Keygen and encapsulation cost about the two halves added together. Decapsulation costs
-more, because the 32-byte secret key is expanded again on every call, which adds a full
-keygen. Draft §5.5.1 lets an implementation cache the expanded key. This code doesn't, to
-stay close to the pseudocode.
+Each X-Wing operation costs about its two halves added together. The exception is
+decapsulating from the seed, which first expands the key, and that costs a full keygen.
+Keeping an `ExpandedKey` avoids that cost.
 
 ## Not for production
 

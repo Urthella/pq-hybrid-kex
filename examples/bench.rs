@@ -20,7 +20,7 @@ fn time<T>(name: &str, mut f: impl FnMut() -> T) {
         black_box(f());
     }
     let micros = (start.elapsed() / RUNS).as_secs_f64() * 1e6;
-    println!("  {name:<12} {micros:>7.1} µs");
+    println!("  {name:<22} {micros:>7.1} µs");
 }
 
 fn main() {
@@ -35,6 +35,10 @@ fn main() {
         xwing::encapsulate_deterministic(black_box(&pk), &eseed)
     });
     time("decapsulate", || xwing::decapsulate(black_box(&ct), &sk));
+    let expanded = xwing::ExpandedKey::unpack(&sk);
+    time("decapsulate, kept key", || {
+        black_box(&expanded).decapsulate(&ct)
+    });
 
     println!("ML-KEM-768 alone (public key 1184 B, ciphertext 1088 B, seed 64 B)");
     let seed = Seed::from([7u8; 64]);
