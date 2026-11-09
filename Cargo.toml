@@ -1,0 +1,17 @@
+[package]
+name = "pq-hybrid-kex"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "X-Wing, the ML-KEM-768 + X25519 hybrid KEM, written out readably and checked against the draft's test vectors"
+repository = "https://github.com/Urthella/pq-hybrid-kex"
+
+[dependencies]
+getrandom = "0.4.3"
+ml-kem = "0.3.4"
+sha3 = "0.12.0"
+shake = "0.1.0"
+x25519-dalek = "3.0.0"
+
+[dev-dependencies]
+x-wing = "0.1.1"
