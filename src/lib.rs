@@ -9,7 +9,7 @@
 //! ```
 //! let (secret_key, public_key) = pq_hybrid_kex::generate();
 //! let (shared, ciphertext) = pq_hybrid_kex::encapsulate(&public_key).unwrap();
-//! assert_eq!(pq_hybrid_kex::decapsulate(&ciphertext, &secret_key), shared);
+//! assert_eq!(secret_key.decapsulate(&ciphertext), shared);
 //! ```
 
 use ml_kem::ml_kem_768::{Ciphertext as MlKemCiphertext, DecapsulationKey, EncapsulationKey};
@@ -47,18 +47,63 @@ impl std::fmt::Display for InvalidPublicKey {
 
 impl std::error::Error for InvalidPublicKey {}
 
-/// The draft's `expandDecapsulationKey`: 96 bytes of SHAKE256 output from the 32-byte secret key
-/// become the ML-KEM seed (d, then z) and the X25519 secret.
-fn expand(sk: &SecretKey) -> (DecapsulationKey, [u8; 32], [u8; 32]) {
-    let mut expanded = [0u8; 96];
-    let mut shake = Shake256::default();
-    shake.update(sk);
-    shake.finalize_xof().read(&mut expanded);
-    let seed = Seed::try_from(&expanded[0..64]).expect("64 bytes");
-    let dk_m = DecapsulationKey::from_seed(seed);
-    let sk_x: [u8; 32] = expanded[64..96].try_into().expect("32 bytes");
-    let pk_x = x25519(sk_x, X25519_BASEPOINT_BYTES);
-    (dk_m, sk_x, pk_x)
+/// A secret key expanded once and kept, as draft section 5.5.1 allows, so that decapsulating
+/// skips the SHAKE256 expansion and the ML-KEM key generation. That pays off when one key opens
+/// many ciphertexts, or opens one right after it was generated, as a TLS client does.
+///
+/// It has no byte form on purpose: the draft says an expanded key MUST NOT pass between
+/// implementations. Store the 32 bytes from [`ExpandedKey::pack`] instead.
+pub struct ExpandedKey {
+    sk: SecretKey,
+    dk_m: DecapsulationKey,
+    sk_x: [u8; 32],
+    pk_x: [u8; 32],
+}
+
+impl ExpandedKey {
+    /// The draft's `UnpackDecapsulationKey`, which is `expandDecapsulationKey`: 96 bytes of
+    /// SHAKE256 output from the 32-byte secret key become the ML-KEM seed (d, then z) and the
+    /// X25519 secret.
+    pub fn unpack(sk: &SecretKey) -> Self {
+        let mut expanded = [0u8; 96];
+        let mut shake = Shake256::default();
+        shake.update(sk);
+        shake.finalize_xof().read(&mut expanded);
+        let seed = Seed::try_from(&expanded[0..64]).expect("64 bytes");
+        let dk_m = DecapsulationKey::from_seed(seed);
+        let sk_x: [u8; 32] = expanded[64..96].try_into().expect("32 bytes");
+        let pk_x = x25519(sk_x, X25519_BASEPOINT_BYTES);
+        Self {
+            sk: *sk,
+            dk_m,
+            sk_x,
+            pk_x,
+        }
+    }
+
+    /// The draft's `PackDecapsulationKey`: the 32-byte secret key, the form to store.
+    pub fn pack(&self) -> SecretKey {
+        self.sk
+    }
+
+    /// The public key that goes with this secret key.
+    pub fn public_key(&self) -> PublicKey {
+        let mut pk = [0u8; PUBLIC_KEY_LEN];
+        pk[..ML_KEM_PUBLIC_KEY_LEN].copy_from_slice(&self.dk_m.encapsulation_key().to_bytes());
+        pk[ML_KEM_PUBLIC_KEY_LEN..].copy_from_slice(&self.pk_x);
+        pk
+    }
+
+    /// The draft's `Decapsulate`. A ciphertext that was tampered with doesn't cause an error:
+    /// ML-KEM rejects it implicitly, so the result is a shared secret the sender doesn't have.
+    pub fn decapsulate(&self, ct: &Ciphertext) -> SharedSecret {
+        let (ct_m, ct_x) = ct.split_at(ML_KEM_CIPHERTEXT_LEN);
+        let ct_x: [u8; 32] = ct_x.try_into().expect("32 bytes");
+        let ct_m = MlKemCiphertext::try_from(ct_m).expect("1088 bytes");
+        let ss_m = self.dk_m.decapsulate(&ct_m);
+        let ss_x = x25519(self.sk_x, ct_x);
+        combine(&ss_m, &ss_x, &ct_x, &self.pk_x)
+    }
 }
 
 /// The draft's `Combiner`: SHA3-256 over both shared secrets, the X25519 ciphertext and public
@@ -81,17 +126,14 @@ fn random<const N: usize>() -> [u8; N] {
 
 /// The draft's `GenerateKeyPairDerand`: the public key that goes with a 32-byte secret key.
 pub fn public_key(sk: &SecretKey) -> PublicKey {
-    let (dk_m, _, pk_x) = expand(sk);
-    let mut pk = [0u8; PUBLIC_KEY_LEN];
-    pk[..ML_KEM_PUBLIC_KEY_LEN].copy_from_slice(&dk_m.encapsulation_key().to_bytes());
-    pk[ML_KEM_PUBLIC_KEY_LEN..].copy_from_slice(&pk_x);
-    pk
+    ExpandedKey::unpack(sk).public_key()
 }
 
-/// The draft's `GenerateKeyPair`: a random secret key and its public key.
-pub fn generate() -> (SecretKey, PublicKey) {
-    let sk = random();
-    (sk, public_key(&sk))
+/// The draft's `GenerateKeyPair`: a random secret key, already expanded, and its public key.
+pub fn generate() -> (ExpandedKey, PublicKey) {
+    let sk = ExpandedKey::unpack(&random());
+    let pk = sk.public_key();
+    (sk, pk)
 }
 
 /// The draft's `EncapsulateDerand`, with the 64 bytes of randomness given: the first 32 for
@@ -123,14 +165,8 @@ pub fn encapsulate(pk: &PublicKey) -> Result<(SharedSecret, Ciphertext), Invalid
     encapsulate_deterministic(pk, &random())
 }
 
-/// The draft's `Decapsulate`. A ciphertext that was tampered with doesn't cause an error: ML-KEM
-/// rejects it implicitly, so the result is a shared secret the sender doesn't have.
+/// The draft's `Decapsulate` from the 32-byte secret key. It expands the key first, which costs
+/// as much as generating it; keep an [`ExpandedKey`] to decapsulate more than once.
 pub fn decapsulate(ct: &Ciphertext, sk: &SecretKey) -> SharedSecret {
-    let (dk_m, sk_x, pk_x) = expand(sk);
-    let (ct_m, ct_x) = ct.split_at(ML_KEM_CIPHERTEXT_LEN);
-    let ct_x: [u8; 32] = ct_x.try_into().expect("32 bytes");
-    let ct_m = MlKemCiphertext::try_from(ct_m).expect("1088 bytes");
-    let ss_m = dk_m.decapsulate(&ct_m);
-    let ss_x = x25519(sk_x, ct_x);
-    combine(&ss_m, &ss_x, &ct_x, &pk_x)
+    ExpandedKey::unpack(sk).decapsulate(ct)
 }
